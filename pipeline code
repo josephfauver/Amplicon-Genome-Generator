@@ -1,0 +1,144 @@
+#!/bin/bash
+
+#programs to install to process data:
+#samtools
+#bwa
+#bedtools
+#ivar
+
+
+#Unique name given to each library. This will be provided in a list file for each library.  
+file_base=$1
+
+#Creates a log for each processing step for each library 
+log=${file_base}.pipeline.log
+
+{
+
+echo "***********************************" 
+echo "begin consensus generation for sample: $file_base" 
+echo "***********************************" 
+
+#variables set of each Read 1 and Read 2 files with same file base. Must be done for paired end sequencing
+f1=${file_base}_R1_001.fastq.gz
+f2=${file_base}_R2_001.fastq.gz
+
+#Hard coded paths to the reference genome you are aligning to, the .bed file for primer postions, .fasta file containing all primer sequences, and .tsv file containg primer pair info 
+#NOTE must provide this path for your own system
+#Easy way to determine path is to enter directory where each file is located, type "pwd". Copy path below and add /your_file_name for each 
+zika_reference=/home/josephfauver/PR_informatics/Reference_Zika/Zika_ref_PR.fa
+primer_file=/home/josephfauver/PR_informatics/ZKV.bed
+primer_fasta=/home/josephfauver/PR_informatics/zika_primers.fa
+pair_information=/home/josephfauver/PR_informatics/pair_information.tsv
+
+#Make directory based on unique name for each library
+#Move paired end read data to each unique library directory 
+#Change into said directory 
+mkdir ${file_base}_data 
+mv $f1 $f2 ${file_base}_data 
+cd ${file_base}_data 
+
+#Align paired end reads to the reference zika virus genome
+bwa mem $zika_reference $f1 $f2 | samtools view -b -F 4 -F 2048 | samtools sort -o ${file_base}_aln.bam
+
+#Perform QC and soft clip primer sequences 
+ivar trim -i ${file_base}_aln.bam -b $primer_file -p ${file_base}_aln_trimmed.bam 
+
+#sort output of ivar 
+samtools sort ${file_base}_aln_trimmed.bam -o ${file_base}_aln_trimmed_sorted.bam 
+
+#index output of ivar 
+samtools index ${file_base}_aln_trimmed_sorted.bam  
+
+#Use samtools to identify variants in reads compared to references, call consensus sequence with ivar 
+samtools mpileup -A -d 0 -Q 0 ${file_base}_aln_trimmed_sorted.bam | ivar consensus -p ${file_base}_consensus
+
+#remove intermediate files not neccesary for analysis 
+rm ${file_base}_aln_trimmed.bam
+rm ${file_base}_aln_trimmed_sorted.bam
+rm ${file_base}_aln_trimmed_sorted.bam.bai
+rm ${file_base}_aln.bam.bai
+
+echo "***********************************" 
+echo "DONE WITH CONSENSUS GENERATION"
+echo "***********************************" 
+
+echo "***********************************" 
+echo "begin variant calling for sample: $file_base" 
+echo "***********************************" 
+
+#make directory to call variants 
+#move new consensu genome into variants directory 
+#move into variants directory 
+mkdir ${file_base}_variants 
+mv $f1 $f2 ${file_base}_variants
+mv ${file_base}_consensus.* ${file_base}_variants
+cd ${file_base}_variants
+
+#index new consensus genome to realign reads 
+bwa index ${file_base}_consensus.fa
+
+#align primer sequences to new conensus sequence and generate .bam file of aligned primers
+bwa mem -k 5 -T 16 ${file_base}_consensus.fa $primer_fasta | samtools view -bS -F 4 | samtools sort -o ${file_base}_primers_aln.bam 
+
+#create new .bed file for primer location on new consensus sequence 
+bedtools bamtobed -i ${file_base}_primers_aln.bam > ${file_base}_primers_file.bed 
+
+#Identify and mark primers with mismatches to new consensus 
+samtools mpileup -A -d 0 --reference ${file_base}_consensus.fa -Q 0 -F 0 ${file_base}_primers_aln.bam | ivar variants -p ${file_base}_primer_mismatch.tsv -t 0.03
+
+#Get names of primers with mismatches in consensus sequence 
+ivar getmasked -i ${file_base}_primer_mismatch.tsv -b ${file_base}_primers_file.bed -f $pair_information -p ${file_base}_masked_primer_names
+
+#realign original reads to new consensus genome to calculate variant number and frequency 
+bwa mem ${file_base}_consensus.fa $f1 $f2 | samtools view -b -F 4 -F 2048 | samtools sort -o ${file_base}_aln_new_consensus.bam
+
+#Perform QC and soft clip primer sequences aligned using new consensus and primer locations
+ivar trim -i ${file_base}_aln_new_consensus.bam -b ${file_base}_primers_file.bed -p ${file_base}_aln_new_consensus_trimmed.bam 
+
+#sort .bam file of reads aligned to new consensus and soft clipped for QC
+samtools sort ${file_base}_aln_new_consensus_trimmed.bam -o ${file_base}_aln_new_consensus_trimmed_sorted.bam
+
+#remove reads generated with primers identified to have a mismatch in the binding region 
+ivar removereads -i ${file_base}_aln_new_consensus_trimmed_sorted.bam -t ${file_base}_masked_primer_names.txt -b ${file_base}_primers_file.bed -p ${file_base}_reads_removed.bam
+
+#sort new .bam file 
+samtools sort ${file_base}_reads_removed.bam -o ${file_base}_reads_removed_sorted_sorted.bam
+
+#index new .bam file  
+samtools index ${file_base}_reads_removed_sorted_sorted.bam
+
+#call variants from indexed and sorted .bam file of reads aligned to new consensus after trimming, QC, and read removal 
+samtools mpileup -A -d 0 --reference ${file_base}_consensus.fa -Q 0 ${file_base}_reads_removed_sorted_sorted.bam | ivar variants -p ${file_base}_variants.tsv -t 0.03
+
+#generate depth of coverage file from final .bam realignment
+samtools depth ${file_base}_reads_removed_sorted_sorted.bam > ${file_base}_DOC.txt 
+
+#Remove unneccesary intermediate files 
+rm ${file_base}_aln_new_consensus.bam
+rm ${file_base}_aln_new_consensus.bam.bai
+rm ${file_base}_aln_new_consensus_trimmed.bam
+rm ${file_base}_aln_new_consensus_trimmed_sorted.bam
+rm ${file_base}_aln_new_consensus_trimmed_sorted.bam.bai
+rm ${file_base}_reads_removed.bam
+rm ${file_base}_consensus.fa.amb
+rm ${file_base}_consensus.fa.ann
+rm ${file_base}_consensus.fa.bwt
+rm ${file_base}_consensus.fa.fai
+rm ${file_base}_consensus.fa.pac
+rm ${file_base}_consensus.fa.sa
+
+
+echo "***********************************" 
+echo "DONE WITH VARIANT CALLING"
+echo "***********************************" 
+
+#finish log file for pipeline 
+} 2>&1  | tee -a $log
+
+#move log file into library directory 
+mv $log ${file_base}_data 
+
+#done with script- outputs original sequence .fq files, .bam file with sequences aligned to original reference, conensus .fa file,
+#primer alignment .bam and .bed to new consensus, .bam file with sequences aligned to consensus and mismatches removed,
+#text file with primers with mismatches, and a log file. 
